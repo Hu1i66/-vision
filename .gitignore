@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# ROS2 build artifacts
+build/
+install/
+log/
+
+# Virtual environment
+.venv/
+
+# Datasets and training outputs (large, not source code)
+images/
+labels/
+runs/
+*.gv
+*.pdf
+
+# Model weights and training logs (large)
+*.pt
+*.txt
+*.log
+
+# Detection artifacts
+detection_info.json
