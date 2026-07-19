@@ -13,6 +13,82 @@ import json
 import math
 import tf_transformations
 
+
+class ObjectTrack:
+    """单个物体 track 的 EMA (指数移动平均) 滤波状态。
+
+    用于平滑 YOLO 检测结果, 消除像素 bbox、深度、坐标的帧间抖动。
+    每个 track 绑定一个类别 + 空间位置 (像素中心), 通过最近邻匹配关联帧间检测。
+    """
+
+    def __init__(self, track_id, class_name, obs, frame_count, alpha=0.25):
+        self.track_id = track_id
+        self.class_name = class_name
+        self.alpha = alpha  # EMA 系数: 新观测权重, 越小越平滑
+        # 上一帧像素中心 (用于匹配)
+        self.last_center_u = obs['center_u']
+        self.last_center_v = obs['center_v']
+        # 滤波状态 (初始值 = 第一次观测)
+        self.s_x1 = float(obs['x1'])
+        self.s_y1 = float(obs['y1'])
+        self.s_x2 = float(obs['x2'])
+        self.s_y2 = float(obs['y2'])
+        self.s_depth = obs.get('depth')        # float or None
+        self.s_cam = list(obs['camera_coords']) if obs.get('camera_coords') is not None else None
+        self.s_ee = list(obs['ee_coords']) if obs.get('ee_coords') is not None else None
+        self.s_base = list(obs['base_coords']) if obs.get('base_coords') is not None else None
+        # 元数据
+        self.last_update_frame = frame_count
+        self.miss_count = 0
+        self.confidence = obs.get('conf', 0.0)
+        self.last_obs = obs  # 保留最新原始观测 (调试用)
+
+    def update(self, obs, frame_count, alpha=None):
+        """用新观测做 EMA 更新。alpha=None 时用 self.alpha。
+        深度失败的帧不更新 s_depth/s_cam/s_ee/s_base (保留上一帧滤波值)。"""
+        a = alpha if alpha is not None else self.alpha
+        self.last_center_u = obs['center_u']
+        self.last_center_v = obs['center_v']
+        # bbox EMA
+        self.s_x1 = a * float(obs['x1']) + (1 - a) * self.s_x1
+        self.s_y1 = a * float(obs['y1']) + (1 - a) * self.s_y1
+        self.s_x2 = a * float(obs['x2']) + (1 - a) * self.s_x2
+        self.s_y2 = a * float(obs['y2']) + (1 - a) * self.s_y2
+        # 深度 EMA (深度失败时保留旧值, 不更新)
+        d = obs.get('depth')
+        if d is not None:
+            if self.s_depth is None:
+                self.s_depth = d
+            else:
+                self.s_depth = a * d + (1 - a) * self.s_depth
+        # 相机坐标 EMA
+        cam = obs.get('camera_coords')
+        if cam is not None:
+            if self.s_cam is None:
+                self.s_cam = list(cam)
+            else:
+                self.s_cam = [a * cam[i] + (1 - a) * self.s_cam[i] for i in range(3)]
+        # 末端坐标 EMA
+        ee = obs.get('ee_coords')
+        if ee is not None:
+            if self.s_ee is None:
+                self.s_ee = list(ee)
+            else:
+                self.s_ee = [a * ee[i] + (1 - a) * self.s_ee[i] for i in range(3)]
+        # 基座坐标 EMA
+        base = obs.get('base_coords')
+        if base is not None:
+            if self.s_base is None:
+                self.s_base = list(base)
+            else:
+                self.s_base = [a * base[i] + (1 - a) * self.s_base[i] for i in range(3)]
+        # 元数据
+        self.last_update_frame = frame_count
+        self.miss_count = 0
+        self.confidence = obs.get('conf', self.confidence)
+        self.last_obs = obs
+
+
 class ObjectDetector(Node):
     def __init__(self):
         super().__init__("object_detector")
@@ -158,7 +234,17 @@ class ObjectDetector(Node):
         self.latest_rgb_stamp = None
         self.rgb_ready = False
         self.frame_count = 0
-        
+
+        # ================== 滤波参数 (EMA + 空间关联) ==================
+        # filter_alpha: EMA 新观测权重, 越小越平滑 (0.1=强滤波, 0.5=弱滤波, 0.0=完全冻结)
+        # filter_match_dist_px: 帧间匹配阈值 (像素), 同类物体中心距离 < 此值视为同一物体
+        # filter_max_misses: 连续多少帧未匹配到则删除 track
+        self.filter_alpha = float(self.declare_parameter("filter_alpha", 0.25).value)
+        self.filter_match_dist_px = float(self.declare_parameter("filter_match_dist_px", 80.0).value)
+        self.filter_max_misses = int(self.declare_parameter("filter_max_misses", 10).value)
+        self._tracks = {}        # {track_id: ObjectTrack}
+        self._next_track_id = 0
+
         # 统计信息
         self.detection_count = 0
         self.status_printed = False
@@ -236,6 +322,39 @@ class ObjectDetector(Node):
 
         # 默认启用自动曝光 (相机未上线时 ros2 param set 会静默失败, 不影响节点启动)
         self.set_exposure(True)
+
+    # ==================== 滤波: track 匹配与清理 ====================
+    def _find_matching_track(self, class_name, center_u, center_v, exclude_ids=None):
+        """在现有 tracks 中找同类且像素中心距离最近的 track (贪心匹配)。
+        exclude_ids: 本帧已匹配过的 track_id 集合, 避免重复匹配。
+        返回 ObjectTrack 或 None。"""
+        exclude_ids = exclude_ids or set()
+        best_track = None
+        best_dist = self.filter_match_dist_px
+        for track in self._tracks.values():
+            if track.track_id in exclude_ids:
+                continue
+            if track.class_name != class_name:
+                continue
+            dx = track.last_center_u - center_u
+            dy = track.last_center_v - center_v
+            dist = math.sqrt(dx * dx + dy * dy)
+            if dist < best_dist:
+                best_dist = dist
+                best_track = track
+        return best_track
+
+    def _cleanup_stale_tracks(self, frame_count):
+        """删除连续 filter_max_misses 帧未匹配的 track, 并对未匹配 track miss_count++。"""
+        stale_ids = [
+            tid for tid, t in self._tracks.items()
+            if t.miss_count >= self.filter_max_misses
+        ]
+        for tid in stale_ids:
+            del self._tracks[tid]
+        for t in self._tracks.values():
+            if t.last_update_frame < frame_count:
+                t.miss_count += 1
 
     # ==================== 物体尺寸查询 ====================
     def _get_class_dimensions(self, class_name):
@@ -650,6 +769,7 @@ class ObjectDetector(Node):
 
             objects_list = []
             primary_info = None  # 主物体完整信息 (最高置信度的有效物体)
+            matched_track_ids = set()  # 本帧已匹配的 track_id, 避免重复匹配
 
             for idx, box in enumerate(boxes_sorted):
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
@@ -665,7 +785,56 @@ class ObjectDetector(Node):
                 real_width, real_height = self._get_class_dimensions(class_name)
                 volume = self.estimate_object_volume(real_width, real_height, shape="sphere")
 
-                # ── 先绘制检测框 + 类别标签 (无论深度是否成功, 确保所有检测都可视化) ──
+                # ========== 单目RGB估计: 用已知物体尺寸反推深度 (原始值) ==========
+                mono_depth = self.monocular_depth_from_bbox([x1, y1, x2, y2], class_name)
+
+                # 原始坐标变换 (深度成功时计算, 用于喂给滤波器)
+                camera_coords = None
+                ee_coords = None
+                base_coords = None
+                if mono_depth is not None:
+                    camera_coords = self.monocular_pixel_to_camera_coords(center_u, center_v, mono_depth)
+                    ee_coords = self.transform_camera_to_end_effector(camera_coords)
+                    if self.robot_current_pose is not None:
+                        base_coords, _ = self.transform_camera_to_base(camera_coords)
+
+                # ========== 滤波: 匹配 track + EMA 更新 ==========
+                # 用原始观测更新 track, 再用滤波值替换发布值 (画框/坐标都用滤波后)
+                raw_obs = {
+                    'x1': float(x1), 'y1': float(y1), 'x2': float(x2), 'y2': float(y2),
+                    'center_u': center_u, 'center_v': center_v,
+                    'depth': mono_depth,
+                    'camera_coords': camera_coords,
+                    'ee_coords': ee_coords,
+                    'base_coords': base_coords,
+                    'conf': conf,
+                }
+                track = self._find_matching_track(class_name, center_u, center_v, matched_track_ids)
+                if track is None:
+                    # 新物体, 创建 track
+                    track_id = self._next_track_id
+                    self._next_track_id += 1
+                    track = ObjectTrack(track_id, class_name, raw_obs, self.frame_count, self.filter_alpha)
+                    self._tracks[track_id] = track
+                else:
+                    matched_track_ids.add(track.track_id)
+                    track.update(raw_obs, self.frame_count, self.filter_alpha)
+
+                # 用滤波值替换 (画框/标注/发布都用平滑后的值)
+                x1, y1, x2, y2 = track.s_x1, track.s_y1, track.s_x2, track.s_y2
+                center_u = int((track.s_x1 + track.s_x2) / 2)
+                center_v = int((track.s_y1 + track.s_y2) / 2)
+                mono_depth = track.s_depth
+                camera_coords = track.s_cam
+                ee_coords = track.s_ee
+                base_coords = track.s_base
+
+                # 距离 (用滤波后的基座坐标重算)
+                distance_to_robot = None
+                if base_coords is not None and robot_position is not None:
+                    distance_to_robot = self.calculate_distance(base_coords, robot_position)
+
+                # ── 绘制检测框 + 类别标签 (用滤波后的 bbox) ──
                 box_color = box_colors[idx % len(box_colors)]
                 cv2.rectangle(display_img, (int(x1), int(y1)), (int(x2), int(y2)), box_color, 2)
                 cv2.circle(display_img, (center_u, center_v), 4, (0, 0, 255), -1)
@@ -680,14 +849,11 @@ class ObjectDetector(Node):
                     coord_label_x = int(x1) + 4
                     coord_label_y = int(y1) + 18
 
-                # ========== 单目RGB估计: 用已知物体尺寸反推深度 ==========
-                mono_depth = self.monocular_depth_from_bbox([x1, y1, x2, y2], class_name)
                 if mono_depth is None:
-                    # 深度估计失败 (像素尺寸异常或超出合理范围), 标注"深度未知"
+                    # 深度估计失败 (像素尺寸异常或超出合理范围, 或 track 从未成功估计深度)
                     cv2.putText(display_img, "depth=N/A",
                                (coord_label_x, coord_label_y),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
-                    # 仍加入 objects 列表 (只含基本信息, 无坐标, GUI 会显示"(无基座坐标)")
                     obj_info = {
                         "index": idx + 1,
                         "object_name": class_name,
@@ -704,30 +870,18 @@ class ObjectDetector(Node):
                         },
                         "volume_m3": round(volume, 6),
                         "depth_available": False,
+                        "filtered": True,
+                        "track_id": track.track_id,
                     }
                     if self.latest_rgb_stamp is not None:
                         obj_info["rgb_stamp_s"] = round(self.latest_rgb_stamp, 6)
                     objects_list.append(obj_info)
                     continue
 
-                # 深度成功, 计算坐标变换
-                camera_coords = self.monocular_pixel_to_camera_coords(center_u, center_v, mono_depth)
+                # 深度成功, obj_x/obj_y/obj_z 从滤波后的 camera_coords 取
                 obj_x, obj_y, obj_z = camera_coords
 
-                # 相机 → 末端
-                ee_coords = self.transform_camera_to_end_effector(camera_coords)
-
-                # 相机 → 基座
-                base_coords = None
-                if self.robot_current_pose is not None:
-                    base_coords, _ = self.transform_camera_to_base(camera_coords)
-
-                # 距离
-                distance_to_robot = None
-                if base_coords is not None and robot_position is not None:
-                    distance_to_robot = self.calculate_distance(base_coords, robot_position)
-
-                # 框旁标注: 深度 + 基座坐标
+                # 框旁标注: 深度 + 基座坐标 (用滤波值)
                 cv2.putText(display_img, f"d={mono_depth:.2f}m",
                            (coord_label_x, coord_label_y),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
@@ -737,7 +891,7 @@ class ObjectDetector(Node):
                                (coord_label_x, coord_label_y + 16),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1)
 
-                # ── 收集物体信息到 objects 列表 ──
+                # ── 收集物体信息到 objects 列表 (用滤波值) ──
                 obj_info = {
                     "index": idx + 1,
                     "object_name": class_name,
@@ -766,6 +920,8 @@ class ObjectDetector(Node):
                     },
                     "volume_m3": round(volume, 6),
                     "depth_available": True,
+                    "filtered": True,  # 标记本帧坐标已经过 EMA 滤波
+                    "track_id": track.track_id,
                 }
                 if base_coords is not None:
                     obj_info["base_position_m"] = {
@@ -795,6 +951,9 @@ class ObjectDetector(Node):
                         coord_data.append(distance_to_robot)
                     coord_msg.data = coord_data
                     self.pub_object_pose.publish(coord_msg)
+
+            # 循环结束: 清理过期 track + 未匹配 track miss_count++
+            self._cleanup_stale_tracks(self.frame_count)
 
             self.robot_current_pose = original_robot_pose
 
