@@ -661,12 +661,56 @@ class ObjectDetector(Node):
                 center_u = int((x1 + x2) / 2)
                 center_v = int((y1 + y2) / 2)
 
+                # 真实尺寸 (按类别查询, 用于深度估计和体积)
+                real_width, real_height = self._get_class_dimensions(class_name)
+                volume = self.estimate_object_volume(real_width, real_height, shape="sphere")
+
+                # ── 先绘制检测框 + 类别标签 (无论深度是否成功, 确保所有检测都可视化) ──
+                box_color = box_colors[idx % len(box_colors)]
+                cv2.rectangle(display_img, (int(x1), int(y1)), (int(x2), int(y2)), box_color, 2)
+                cv2.circle(display_img, (center_u, center_v), 4, (0, 0, 255), -1)
+                label = f"#{idx+1} {class_name}: {conf:.2f}"
+                cv2.putText(display_img, label, (int(x1), max(int(y1)-8, 12)),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.55, box_color, 2)
+
+                # 框旁标注位置 (优先放框右下外侧, 出界则放框内左上)
+                coord_label_x = int(x2) + 4
+                coord_label_y = int(y2)
+                if coord_label_x > display_img.shape[1] - 200:
+                    coord_label_x = int(x1) + 4
+                    coord_label_y = int(y1) + 18
+
                 # ========== 单目RGB估计: 用已知物体尺寸反推深度 ==========
                 mono_depth = self.monocular_depth_from_bbox([x1, y1, x2, y2], class_name)
                 if mono_depth is None:
+                    # 深度估计失败 (像素尺寸异常或超出合理范围), 标注"深度未知"
+                    cv2.putText(display_img, "depth=N/A",
+                               (coord_label_x, coord_label_y),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
+                    # 仍加入 objects 列表 (只含基本信息, 无坐标, GUI 会显示"(无基座坐标)")
+                    obj_info = {
+                        "index": idx + 1,
+                        "object_name": class_name,
+                        "confidence": conf,
+                        "class_id": cls_id,
+                        "bbox_pixel": {
+                            "x1": int(x1), "y1": int(y1),
+                            "x2": int(x2), "y2": int(y2)
+                        },
+                        "size_m": {
+                            "width": round(real_width, 4),
+                            "height": round(real_height, 4),
+                            "diameter": round((real_width + real_height) / 2, 4),
+                        },
+                        "volume_m3": round(volume, 6),
+                        "depth_available": False,
+                    }
+                    if self.latest_rgb_stamp is not None:
+                        obj_info["rgb_stamp_s"] = round(self.latest_rgb_stamp, 6)
+                    objects_list.append(obj_info)
                     continue
 
-                # 像素 → 相机3D坐标
+                # 深度成功, 计算坐标变换
                 camera_coords = self.monocular_pixel_to_camera_coords(center_u, center_v, mono_depth)
                 obj_x, obj_y, obj_z = camera_coords
 
@@ -683,25 +727,7 @@ class ObjectDetector(Node):
                 if base_coords is not None and robot_position is not None:
                     distance_to_robot = self.calculate_distance(base_coords, robot_position)
 
-                # 真实尺寸 (按类别查询)
-                real_width, real_height = self._get_class_dimensions(class_name)
-                volume = self.estimate_object_volume(real_width, real_height, shape="sphere")
-
-                # ── 绘制检测框 + 类别标签 (每个物体用不同颜色) ──
-                box_color = box_colors[idx % len(box_colors)]
-                cv2.rectangle(display_img, (int(x1), int(y1)), (int(x2), int(y2)), box_color, 2)
-                cv2.circle(display_img, (center_u, center_v), 4, (0, 0, 255), -1)
-
-                label = f"#{idx+1} {class_name}: {conf:.2f}"
-                cv2.putText(display_img, label, (int(x1), max(int(y1)-8, 12)),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.55, box_color, 2)
-
-                # 框旁紧凑标注: 深度 + 基座坐标 (优先放框右下外侧, 出界则放框内左上)
-                coord_label_x = int(x2) + 4
-                coord_label_y = int(y2)
-                if coord_label_x > display_img.shape[1] - 200:
-                    coord_label_x = int(x1) + 4
-                    coord_label_y = int(y1) + 18
+                # 框旁标注: 深度 + 基座坐标
                 cv2.putText(display_img, f"d={mono_depth:.2f}m",
                            (coord_label_x, coord_label_y),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
@@ -738,7 +764,8 @@ class ObjectDetector(Node):
                         "diameter": round((real_width + real_height) / 2, 4),
                         "note": "known_size, not estimated from depth"
                     },
-                    "volume_m3": round(volume, 6)
+                    "volume_m3": round(volume, 6),
+                    "depth_available": True,
                 }
                 if base_coords is not None:
                     obj_info["base_position_m"] = {
