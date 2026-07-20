@@ -109,10 +109,10 @@ class ObjectDetector(Node):
         # length=长(对应像素宽度), width=宽(深度方向), height=高(对应像素高度)
         # 单目深度估计用 length (像素宽度方向) 和 height (像素高度方向) 反推 depth。
         self.OBJECT_DIMENSIONS = {
-            "green apple": {"length_m": 0.076, "width_m": 0.076, "height_m": 0.065},
+            "green apple": {"length_m": 0.0836, "width_m": 0.0836, "height_m": 0.0715},
             "apple":       {"length_m": 0.076, "width_m": 0.076, "height_m": 0.065},
             "honey peach": {"length_m": 0.075, "width_m": 0.076, "height_m": 0.065},
-            "lemon":       {"length_m": 0.080, "width_m": 0.054, "height_m": 0.054},
+            "lemon":       {"length_m": 0.080, "width_m": 0.054, "height_m": 0.0648},
             "orange":      {"length_m": 0.069, "width_m": 0.069, "height_m": 0.055},
             "pear":        {"length_m": 0.090, "width_m": 0.075, "height_m": 0.074},
             "strawberry":  {"length_m": 0.090, "width_m": 0.060, "height_m": 0.046},
