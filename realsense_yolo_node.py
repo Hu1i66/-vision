@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-from collections import deque
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import CompressedImage, Image
+from sensor_msgs.msg import CompressedImage, Image, CameraInfo
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from std_msgs.msg import Float64MultiArray, String
 from visualization_msgs.msg import Marker
@@ -143,86 +142,73 @@ class ObjectDetector(Node):
             0.000473717313218756,     # p2
             -0.0946382536306512       # k3
         ], dtype=np.float64)
+
+        # ── camera_info 实时内参 (订阅 /camera/camera/color/camera_info 后覆盖上方硬编码) ──
+        # D455 出厂标定的内参通过 camera_info 话题发布, 比硬编码值更准
+        # (fx≈384.8 vs 硬编码 378.4, ~1.7% 差异在 0.5m 处产生 ~8.5mm 位置误差)
+        # 硬编码值保留作为 camera_info 未到达时的 fallback
+        self._cam_info_received = False
         
-        # ================== 手眼标定数据（相机到机械臂末端）==================
-        # 来源: /home/lxf/handeye/result/2026-06-06_04-12-35_calibration.json
+        # ================== 手眼标定数据（相机到机械臂基座, 眼在手外）==================
+        # 来源: /home/lxf/handeye/result/2026-07-25_03-57-46_calibration.json
+        # eye-to-hand: 相机固定在传送带上方, T_cam_to_base 是常量 (不依赖 TCP 位姿)
         # 平移向量 (单位: 米)
-        self.camera_to_end_effector_translation = np.array([
-            -0.05422316663526302,   # X
-            -0.013957644547681143,  # Y
-            0.05028944875035352     # Z
+        self.camera_to_base_translation = np.array([
+            0.6732749433043899,   # X
+            0.010662122461489898, # Y
+            0.597133855461562     # Z
         ])
 
-        # 可选覆盖：允许在运行时通过参数微调手眼平移偏置（JSON: {"dx":.., "dy":.., "dz":..}）
-        self.translation_override_str = self.declare_parameter(
-            "camera_to_end_effector_translation_override",
-            ""
-        ).value
-        try:
-            if self.translation_override_str:
-                ov = json.loads(self.translation_override_str)
-                dx = float(ov.get('dx', 0.0))
-                dy = float(ov.get('dy', 0.0))
-                dz = float(ov.get('dz', 0.0))
-                self.get_logger().info(f"应用手眼平移覆盖: dx={dx}, dy={dy}, dz={dz}")
-                self.camera_to_end_effector_translation += np.array([dx, dy, dz])
-        except Exception as e:
-            self.get_logger().warning(f"解析 camera_to_end_effector_translation_override 失败: {e}")
-
         # 四元数 (x, y, z, w)
-        self.camera_to_end_effector_quat = np.array([
-            -0.12424486698275353,   # qx
-            0.12698436455305506,    # qy
-            -0.6964799119233258,    # qz
-            0.6952365902876309      # qw
+        self.camera_to_base_quat = np.array([
+            -0.6934151560947895,   # qx
+            -0.7119098057466932,   # qy
+            0.08845804637870601,   # qz
+            0.06734258541670725    # qw
         ])
 
         # RPY 角度 (弧度)
-        self.camera_to_end_effector_rpy = np.array([
-            -0.35719260380711015,   # roll
-            0.00350025238464289,    # pitch
-            -1.5732149370763389     # yaw
+        self.camera_to_base_rpy = np.array([
+            -2.9203729063228363,   # roll
+            0.026795812790156897,  # pitch
+            1.6000918271309976     # yaw
         ])
-        
+
         # ================== 构建完整的变换矩阵 ==================
         # 方法1：使用四元数构建旋转矩阵
-        self.rotation_matrix_cam_to_ee = self.quaternion_to_rotation_matrix(
-            self.camera_to_end_effector_quat
+        self.rotation_matrix_cam_to_base = self.quaternion_to_rotation_matrix(
+            self.camera_to_base_quat
         )
-        
+
         # 方法2：使用 RPY 角度构建旋转矩阵（验证用）
-        self.rotation_matrix_cam_to_ee_rpy = self.rpy_to_rotation_matrix(
-            self.camera_to_end_effector_rpy
+        self.rotation_matrix_cam_to_base_rpy = self.rpy_to_rotation_matrix(
+            self.camera_to_base_rpy
         )
-        
-        # 构建 4x4 齐次变换矩阵 (相机坐标系 -> 机械臂末端坐标系)
-        self.transform_cam_to_ee = np.eye(4)
-        self.transform_cam_to_ee[:3, :3] = self.rotation_matrix_cam_to_ee
-        self.transform_cam_to_ee[:3, 3] = self.camera_to_end_effector_translation
-        
-        # 计算机械臂末端到相机的逆变换（用于验证）
-        self.transform_ee_to_cam = np.linalg.inv(self.transform_cam_to_ee)
-        
+
+        # 构建 4x4 齐次变换矩阵 (相机坐标系 -> 机械臂基坐标系, eye-to-hand 常量)
+        self.transform_cam_to_base = np.eye(4)
+        self.transform_cam_to_base[:3, :3] = self.rotation_matrix_cam_to_base
+        self.transform_cam_to_base[:3, 3] = self.camera_to_base_translation
+
+        # 计算基座到相机的逆变换（用于验证）
+        self.transform_base_to_cam = np.linalg.inv(self.transform_cam_to_base)
+
         self.get_logger().info("=" * 60)
-        self.get_logger().info("🔧 手眼标定参数已加载:")
-        self.get_logger().info(f"   平移: X={self.camera_to_end_effector_translation[0]:.6f}m")
-        self.get_logger().info(f"         Y={self.camera_to_end_effector_translation[1]:.6f}m")
-        self.get_logger().info(f"         Z={self.camera_to_end_effector_translation[2]:.6f}m")
-        self.get_logger().info(f"   四元数: qx={self.camera_to_end_effector_quat[0]:.6f}")
-        self.get_logger().info(f"           qy={self.camera_to_end_effector_quat[1]:.6f}")
-        self.get_logger().info(f"           qz={self.camera_to_end_effector_quat[2]:.6f}")
-        self.get_logger().info(f"           qw={self.camera_to_end_effector_quat[3]:.6f}")
-        self.get_logger().info(f"   RPY: roll={math.degrees(self.camera_to_end_effector_rpy[0]):.2f}°")
-        self.get_logger().info(f"         pitch={math.degrees(self.camera_to_end_effector_rpy[1]):.2f}°")
-        self.get_logger().info(f"         yaw={math.degrees(self.camera_to_end_effector_rpy[2]):.2f}°")
+        self.get_logger().info("🔧 手眼标定参数已加载 (eye-to-hand):")
+        self.get_logger().info(f"   平移: X={self.camera_to_base_translation[0]:.6f}m")
+        self.get_logger().info(f"         Y={self.camera_to_base_translation[1]:.6f}m")
+        self.get_logger().info(f"         Z={self.camera_to_base_translation[2]:.6f}m")
+        self.get_logger().info(f"   四元数: qx={self.camera_to_base_quat[0]:.6f}")
+        self.get_logger().info(f"           qy={self.camera_to_base_quat[1]:.6f}")
+        self.get_logger().info(f"           qz={self.camera_to_base_quat[2]:.6f}")
+        self.get_logger().info(f"           qw={self.camera_to_base_quat[3]:.6f}")
+        self.get_logger().info(f"   RPY: roll={math.degrees(self.camera_to_base_rpy[0]):.2f}°")
+        self.get_logger().info(f"         pitch={math.degrees(self.camera_to_base_rpy[1]):.2f}°")
+        self.get_logger().info(f"         yaw={math.degrees(self.camera_to_base_rpy[2]):.2f}°")
         self.get_logger().info("=" * 60)
-        
-        # ================== 机械臂当前位姿（如果连接了机械臂）==================
-        self.robot_current_pose = None
-        self.robot_pose_topic = self.declare_parameter(
-            "robot_pose_topic",
-            "/feedback/tcp_pose"
-        ).value
+
+        # ================== eye-to-hand: 无需机械臂位姿订阅 ==================
+        # 相机固定, T_cam_to_base 是常量, 不再订阅 /feedback/tcp_pose
         # RViz 可视化用的基座坐标系 frame_id
         self.base_frame_id = self.declare_parameter(
             "base_frame_id",
@@ -245,6 +231,29 @@ class ObjectDetector(Node):
         self._tracks = {}        # {track_id: ObjectTrack}
         self._next_track_id = 0
 
+        # ================== 深度相机 (D455) 配置 ==================
+        # 深度相机开关 (默认开启, 失败时自动回退到单目)
+        self.use_depth_camera = self.declare_parameter('use_depth_camera', True).value
+        self._depth_fallback_count = 0  # 统计回退到单目的次数
+        self._depth_total_count = 0    # 深度估计总次数 (D455尝试次数, 用于回退比率)
+
+        # ── D455 深度偏差校正 (单位: 米) ──
+        # eye-to-hand: 相机在可靠深度范围 (0.5-0.8m), 无需近距校正, 默认 0.0
+        # 保留参数供未来微调: 正值=减深度=物体抬高
+        self.depth_offset_m = float(self.declare_parameter('depth_offset_m', 0.0).value)
+        self._depth_diag_logged = False  # 仅首帧打印诊断
+
+        # ── eye-to-hand X/Y 标定偏差补偿 (单位: 米) ──
+        # 现象: base_position_m 的 X/Y 偏大 2-3cm → GUI 显示和抓取都偏
+        # 补偿: 加到 base 坐标 (负值=减去=修正偏大, 默认 -0.025 = 减 2.5cm)
+        # 调参: ros2 param set /object_detector x_offset_m -0.020
+        #       ros2 param set /object_detector y_offset_m -0.020
+        self.x_offset_m = float(self.declare_parameter('x_offset_m', -0.025).value)
+        self.y_offset_m = float(self.declare_parameter('y_offset_m', 0.005).value)
+        # Z 补偿: 正值=抬高 (防下探过多撞台面), 默认 +0.030 = 加 3cm
+        # 调参: ros2 param set /object_detector z_offset_m 0.025
+        self.z_offset_m = float(self.declare_parameter('z_offset_m', 0.030).value)
+
         # 统计信息
         self.detection_count = 0
         self.status_printed = False
@@ -261,20 +270,28 @@ class ObjectDetector(Node):
         self.pub_object_marker = self.create_publisher(Marker, "/object_marker", 10)
         self.pub_object_pose_stamped = self.create_publisher(PoseStamped, "/object_pose", 10)
 
-        # 保留一段机械臂位姿历史，按图像时间戳取最近值，避免图像/位姿错位
-        self.robot_pose_history = deque(maxlen=500)
-        self.robot_pose_sync_tolerance = 0.15
-
-        # 订阅机械臂位姿
-        self.sub_robot_pose = self.create_subscription(
-            PoseStamped,
-            self.robot_pose_topic,
-            self.robot_pose_cb,
-            10
-        )
+        # eye-to-hand: 无需机械臂位姿订阅, 相机变换是常量
 
         # 纯RGB单目模式：只订阅彩色图像，深度由已知物体尺寸反推
         self.sub_rgb = self.create_subscription(Image, "/camera/camera/color/image_raw", self.rgb_cb, 10)
+
+        # D455 对齐深度图订阅 (与 RGB 像素坐标严格对齐)
+        self.sub_depth = self.create_subscription(
+            Image,
+            "/camera/camera/aligned_depth_to_color/image_raw",
+            self.depth_cb,
+            10
+        )
+        self.latest_depth = None           # uint16 ndarray (mm)
+        self.latest_depth_stamp = 0.0      # 时间戳 (秒)
+
+        # ── 订阅 camera_info: 实时获取 D455 出厂内参 (替代上方硬编码) ──
+        self.sub_cam_info = self.create_subscription(
+            CameraInfo,
+            "/camera/camera/color/camera_info",
+            self.camera_info_cb,
+            10
+        )
 
         # ==================== 曝光调节相关代码 ====================
         # 注意: 本节点通过 ROS2 订阅图像, 不直接持有 RealSense pipeline。
@@ -309,6 +326,7 @@ class ObjectDetector(Node):
         # 定时器
         self.create_timer(0.1, self.detect_and_publish)
         self.status_timer = self.create_timer(5.0, self.print_status)
+        self._depth_status_timer = self.create_timer(5.0, self._depth_status_log)
 
         # OpenCV 窗口 (仅 standalone 模式)
         if self.show_gui_window:
@@ -317,7 +335,7 @@ class ObjectDetector(Node):
 
         self.get_logger().info("✅ 节点启动，等待相机数据...")
         self.get_logger().info(f"🔍 检测阈值: {self.CONF_THRESHOLD}")
-        self.get_logger().info(f"🤖 机械臂位姿话题: {self.robot_pose_topic}")
+        self.get_logger().info(f"📷 眼在手外 (eye-to-hand): 相机变换为常量, 无需 TCP 位姿订阅")
         self.get_logger().info(f"🖼️  RViz TF 基座 frame: {self.base_frame_id}")
 
         # 默认启用自动曝光 (相机未上线时 ros2 param set 会静默失败, 不影响节点启动)
@@ -469,13 +487,6 @@ class ObjectDetector(Node):
         rotation_matrix = R_z @ R_y @ R_x
         return rotation_matrix
     
-    def robot_pose_cb(self, msg):
-        """接收机械臂当前位姿"""
-        self.robot_current_pose = msg
-        stamp = msg.header.stamp
-        stamp_sec = float(stamp.sec) + float(stamp.nanosec) * 1e-9
-        self.robot_pose_history.append((stamp_sec, msg))
-
     def pose_stamped_to_dict(self, pose_msg):
         """将 PoseStamped 转为可发布的字典。"""
         if pose_msg is None:
@@ -497,16 +508,6 @@ class ObjectDetector(Node):
     def _stamp_to_sec(self, stamp):
         return float(stamp.sec) + float(stamp.nanosec) * 1e-9
 
-    def _get_best_robot_pose(self, target_stamp_sec):
-        if not self.robot_pose_history:
-            return self.robot_current_pose, None
-
-        best_stamp, best_msg = min(
-            self.robot_pose_history,
-            key=lambda item: abs(item[0] - target_stamp_sec)
-        )
-        return best_msg, abs(best_stamp - target_stamp_sec)
-        
     def print_status(self):
         """打印状态信息"""
         if not self.status_printed:
@@ -514,92 +515,86 @@ class ObjectDetector(Node):
             self.get_logger().info("=" * 60)
             self.get_logger().info("📊 状态统计:")
             self.get_logger().info(f"  - RGB 数据: {'就绪' if self.rgb_ready else '等待中'}")
-            self.get_logger().info(f"  - 机械臂位姿: {'就绪' if self.robot_current_pose else '未连接'}")
+            self.get_logger().info(f"  - 眼在手外: 相机变换为常量 (无需机械臂位姿)")
             self.get_logger().info(f"  - 已处理帧数: {self.frame_count}")
             self.get_logger().info(f"  - 检测到物体: {self.detection_count} 次")
             self.get_logger().info("=" * 60)
             self.status_timer.cancel()
-        
+
+    def _depth_status_log(self):
+        """周期诊断 (每5s): D455 深度图接收状态 + 单目回退比率.
+        结论性区分两种故障:
+          (a) latest_depth=None → 深度话题未收到 → 全程单目 (直径≈预设/距离抖动/质心z=None→撞台面)
+          (b) 话题活着但逐物体回退 → bbox中心5x5无效像素<3 或 深度超出0.2~3.0m
+        """
+        if not self.use_depth_camera:
+            return
+        if self.latest_depth is None:
+            self.get_logger().error(
+                "❌ D455 深度图未收到 (latest_depth=None)! "
+                "话题 /camera/camera/aligned_depth_to_color/image_raw 无数据 → 全程单目 "
+                "(用预设尺寸: 直径≈预设, 距离抖动, 质心z=None→夹爪撞台面). "
+                "修复: 相机以 align_depth.enable:=true 启动, 并确认 ros2 topic list 含 aligned_depth")
+            return
+        total = self._depth_total_count
+        fb = self._depth_fallback_count
+        if total > 0:
+            ok = total - fb
+            ratio = fb / total * 100.0
+            if fb > 0:
+                self.get_logger().warn(
+                    f"⚠️ D455 深度: {ok}/{total} 成功, {fb} 回退单目 ({ratio:.0f}%). "
+                    f"回退时用预设尺寸 (直径≈预设, 距离抖动). "
+                    f"可能原因: bbox中心5x5无效像素<3 或 深度超出0.2~3.0m")
+            else:
+                self.get_logger().info(f"✅ D455 深度: {ok}/{total} 全部成功 (无单目回退)")
+        # 重置周期计数
+        self._depth_total_count = 0
+        self._depth_fallback_count = 0
+
     def rgb_cb(self, msg):
         """接收 RGB 图像"""
         try:
             img = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
             self.latest_rgb = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
             self.latest_rgb_stamp = self._stamp_to_sec(msg.header.stamp)
-            
+
             if not self.rgb_ready:
                 self.rgb_ready = True
                 self.get_logger().info(f"✅ RGB 就绪: {msg.width}x{msg.height}")
         except Exception as e:
             self.get_logger().error(f"RGB 转换错误: {e}")
+
+    def depth_cb(self, msg):
+        """接收 D455 对齐深度图 (uint16, mm). 像素坐标与 RGB 严格对齐."""
+        try:
+            self.latest_depth = np.frombuffer(
+                msg.data, dtype=np.uint16
+            ).reshape(msg.height, msg.width).copy()
+            self.latest_depth_stamp = self._stamp_to_sec(msg.header.stamp)
+        except Exception as e:
+            self.get_logger().error(f"深度图解析失败: {e}")
+            self.latest_depth = None
             
-    def transform_camera_to_end_effector(self, camera_coords):
-        """
-        将相机坐标系下的坐标转换到机械臂末端坐标系
-        使用完整的手眼标定变换矩阵（包含旋转）
-        """
-        # 转换为齐次坐标
-        point_homogeneous = np.append(camera_coords, 1)
-        
-        # 应用变换
-        end_effector_coords = self.transform_cam_to_ee @ point_homogeneous
-        
-        return end_effector_coords[:3]
-    
-    def transform_end_effector_to_base(self, end_effector_coords):
-        """
-        将机械臂末端坐标系下的坐标转换到基坐标系
-        需要机械臂当前位姿
-        """
-        if self.robot_current_pose is None:
-            return None
-        
-        # 获取机械臂末端的位姿
-        ee_x = self.robot_current_pose.pose.position.x
-        ee_y = self.robot_current_pose.pose.position.y
-        ee_z = self.robot_current_pose.pose.position.z
-        
-        ee_qx = self.robot_current_pose.pose.orientation.x
-        ee_qy = self.robot_current_pose.pose.orientation.y
-        ee_qz = self.robot_current_pose.pose.orientation.z
-        ee_qw = self.robot_current_pose.pose.orientation.w
-        
-        # 四元数转旋转矩阵
-        rotation_matrix = tf_transformations.quaternion_matrix([ee_qx, ee_qy, ee_qz, ee_qw])
-        R_ee_to_base = rotation_matrix[:3, :3]
-        
-        # 机械臂末端位置
-        T_ee_to_base = np.array([ee_x, ee_y, ee_z])
-        
-        # 转换
-        base_coords = R_ee_to_base @ end_effector_coords + T_ee_to_base
-        
-        return base_coords
-    
     def transform_camera_to_base(self, camera_coords):
+        """相机坐标 → 基座坐标 (eye-to-hand: 直接用常量变换矩阵)
+
+        eye-to-hand 配置下相机固定, T_cam_to_base 是常量, 不再需要
+        相机→末端→基座的两阶段变换, 也无需 TCP 位姿订阅.
         """
-        完整的转换：相机坐标系 -> 机械臂末端坐标系 -> 机械臂基坐标系
-        """
-        # 步骤1：相机坐标系 -> 机械臂末端坐标系
-        ee_coords = self.transform_camera_to_end_effector(camera_coords)
-        
-        # 步骤2：机械臂末端坐标系 -> 机械臂基坐标系
-        base_coords = self.transform_end_effector_to_base(ee_coords)
-        
-        return base_coords, ee_coords
-    
+        if camera_coords is None:
+            return None, None
+        point_homogeneous = np.append(camera_coords, 1)
+        base_coords = self.transform_cam_to_base @ point_homogeneous
+        # X/Y 标定偏差补偿 (仅修正 main detection 位置, 不影响 PCA/质心 z 计算)
+        base_coords[0] += self.x_offset_m
+        base_coords[1] += self.y_offset_m
+        base_coords[2] += self.z_offset_m  # Z 补偿 (防下探过多)
+        return base_coords[:3], None  # ee_coords 不再适用, 返回 None
+
     def get_robot_current_position(self):
-        """
-        获取机械臂当前位置（基坐标系下）
-        """
-        if self.robot_current_pose is not None:
-            return np.array([
-                self.robot_current_pose.pose.position.x,
-                self.robot_current_pose.pose.position.y,
-                self.robot_current_pose.pose.position.z
-            ])
-        else:
-            return None
+        """eye-to-hand: 不再跟踪机械臂位姿, 返回 None"""
+        return None
     
     def calculate_distance(self, point1, point2):
         """计算两点之间的欧氏距离"""
@@ -645,6 +640,66 @@ class ObjectDetector(Node):
             return None
 
         return depth
+
+    def depth_from_camera(self, box):
+        """从 D455 对齐深度图提取物体深度 (米).
+
+        策略: 取 bbox 中心 5x5 像素区域的中位数.
+        - 用中位数而非均值: 抗噪、抗无效像素
+        - 用中心小区域而非整个 bbox: 避免 bbox 松散时混入背景深度
+        - 水果类物体近似球/椭球, bbox 中心通常落在物体表面
+
+        Args:
+            box: [x1, y1, x2, y2] 像素坐标
+
+        Returns:
+            depth_m (float) 或 None (无有效深度)
+        """
+        if self.latest_depth is None:
+            return None
+
+        x1, y1, x2, y2 = [int(v) for v in box]
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+
+        h, w = self.latest_depth.shape
+        x_start = max(0, cx - 2)
+        x_end = min(w, cx + 3)
+        y_start = max(0, cy - 2)
+        y_end = min(h, cy + 3)
+
+        region = self.latest_depth[y_start:y_end, x_start:x_end]
+        valid = region[region > 0]
+
+        if len(valid) < 3:
+            return None
+
+        depth_mm = float(np.median(valid))
+        depth_m = depth_mm / 1000.0
+
+        if depth_m < 0.2 or depth_m > 3.0:
+            return None
+
+        # ── D455 近距离偏差校正 ──
+        # 减去 depth_offset_m 修正 D455 在 <0.4m 近距离的系统性偏大
+        raw_depth_m = depth_m
+        if self.depth_offset_m != 0.0:
+            depth_m = depth_m - self.depth_offset_m
+            if depth_m < 0.1:
+                depth_m = 0.1  # 防止过度校正
+
+        # ── 诊断日志: D455 原始深度 vs 单目估算深度 (仅首帧) ──
+        if not self._depth_diag_logged:
+            self._depth_diag_logged = True
+            self.get_logger().info("=" * 60)
+            self.get_logger().info("📐 D455 深度诊断 (首帧):")
+            self.get_logger().info(f"   D455 原始深度 (cam_z): {raw_depth_m:.3f}m")
+            self.get_logger().info(f"   校正量 depth_offset_m: {self.depth_offset_m:.3f}m")
+            self.get_logger().info(f"   校正后深度 (cam_z): {depth_m:.3f}m")
+            self.get_logger().info(f"   (若 base_z 仍偏低, 调大 depth_offset_m; 偏高则调小)")
+            self.get_logger().info("=" * 60)
+
+        return depth_m
 
     def monocular_pixel_to_camera_coords(self, u, v, depth):
         """
@@ -715,6 +770,148 @@ class ObjectDetector(Node):
         ps.pose.orientation.w = 1.0
         self.pub_object_pose_stamped.publish(ps)
 
+    def camera_info_cb(self, msg):
+        """从 /camera/camera/color/camera_info 实时更新内参 (替代硬编码).
+
+        D455 出厂标定的内参通过此话题发布。仅首帧更新 (内参不变),
+        覆盖 __init__ 中的硬编码 fx/fy/cx/cy/camera_matrix/dist_coeffs。
+        """
+        if getattr(self, '_cam_info_received', False):
+            return  # 仅首帧更新, 避免每帧重复解析
+        try:
+            k = np.array(msg.k, dtype=np.float64).reshape(3, 3)
+            new_fx = float(k[0, 0])
+            new_fy = float(k[1, 1])
+            new_cx = float(k[0, 2])
+            new_cy = float(k[1, 2])
+            if new_fx <= 0 or new_fy <= 0:
+                return
+            self.fx, self.fy, self.cx, self.cy = new_fx, new_fy, new_cx, new_cy
+            self.skew = float(k[0, 1])
+            self.camera_matrix = k
+            if len(msg.d) > 0:
+                self.dist_coeffs = np.array(msg.d, dtype=np.float64)
+            self._cam_info_received = True
+            self.get_logger().info("=" * 60)
+            self.get_logger().info("📥 camera_info 已更新内参 (替代硬编码 fallback):")
+            self.get_logger().info(f"   fx={self.fx:.4f} fy={self.fy:.4f} "
+                                   f"cx={self.cx:.4f} cy={self.cy:.4f}")
+            self.get_logger().info("=" * 60)
+        except Exception as e:
+            self.get_logger().warning(f"解析 camera_info 失败: {e}")
+
+    def _compute_grasp_orientation(self, bbox_xyxy, depth_mm, object_base_z,
+                                   margin_ratio=0.3, elongation_threshold=1.5,
+                                   height_band=0.03, min_points=30):
+        """从 bbox 内 D455 深度点云用 PCA 计算物体短轴, 生成夹爪朝向 (顶视 + 短轴对齐)。
+
+        坐标系约定 (与 auto_sorting_action.py 一致):
+          - 夹爪 Z 轴 = 接近方向 (朝下 [0,0,-1])
+          - 夹爪 X 轴 = 开合方向 (对齐物体短轴, 手指从两条长边合拢夹窄腰)
+          - 夹爪 Y 轴 = 手指长度方向 (Z × X)
+
+        Args:
+            bbox_xyxy: [x1,y1,x2,y2] 像素坐标 (滤波后)
+            depth_mm: D455 对齐深度图 (uint16, mm) = self.latest_depth
+            object_base_z: 物体在 base 系的 z (滤波后), 用于高度带通剔除传送带/背景
+        Returns:
+            (quat_list, elongation_ratio): quat=[qx,qy,qz,qw] 或 None (圆物体/失败)
+        """
+        if depth_mm is None:
+            return None, None, None
+        # eye-to-hand: T_cam_to_base 是常量, 不再依赖 robot_current_pose
+        try:
+            x1, y1, x2, y2 = [int(v) for v in bbox_xyxy]
+            h_img, w_img = depth_mm.shape
+            bw = x2 - x1
+            bh = y2 - y1
+            mx = int(bw * margin_ratio)
+            my = int(bh * margin_ratio)
+            x1m = max(0, x1 - mx)
+            y1m = max(0, y1 - my)
+            x2m = min(w_img, x2 + mx)
+            y2m = min(h_img, y2 + my)
+            sub = depth_mm[y1m:y2m, x1m:x2m]
+            if sub.size == 0:
+                return None, None, None
+            valid_mask = sub > 0
+            ys, xs = np.nonzero(valid_mask)
+            if len(xs) < min_points:
+                return None, None, None
+            depths_m = sub[ys, xs].astype(np.float64) / 1000.0
+            # D455 深度偏移修正 (eye-to-hand 下默认 0.0)
+            if self.depth_offset_m != 0.0:
+                depths_m = depths_m - self.depth_offset_m
+                depths_m = np.maximum(depths_m, 0.1)
+            # 全局图像像素坐标
+            us = xs + x1m
+            vs = ys + y1m
+            # 反投影到相机坐标 (用 camera_info 内参)
+            cam_x = (us - self.cx) * depths_m / self.fx
+            cam_y = (vs - self.cy) * depths_m / self.fy
+            cam_z = depths_m
+            # eye-to-hand: 直接变换到 base 系 (常量矩阵, 无需 TCP 位姿)
+            cam_pts = np.stack([cam_x, cam_y, cam_z, np.ones_like(cam_x)], axis=0)  # 4xN
+            base_pts = (self.transform_cam_to_base @ cam_pts)[:3, :]  # 3xN
+            base_pts[2, :] += self.z_offset_m  # Z 补偿 (与主检测路径一致)
+            bz = base_pts[2, :]
+            # ── 质心 z 估算 (不依赖预设尺寸): 物体层点云 z 范围 ──
+            # object_base_z 是表面 z (bbox 中心), 过滤远背景 (z < 表面-0.12),
+            # 取物体层 z 的 [25%, 90%] 分位作为 [底, 顶], 高度=顶-底
+            # 质心 = 表面 - height/2, 限制 height/2 <= 0.025
+            # (防 z_bot 含背景桌面/D455近距偏差导致质心过低 → 撞台面)
+            obj_layer_mask = bz > (object_base_z - 0.12)
+            bz_obj = bz[obj_layer_mask]
+            if len(bz_obj) >= 10:
+                _z_top = float(np.percentile(bz_obj, 90))
+                _z_bot = float(np.percentile(bz_obj, 25))
+                _height = max(0.0, _z_top - _z_bot)
+                _delta = min(_height / 2.0, 0.025)
+                centroid_z = float(object_base_z) - _delta
+            else:
+                centroid_z = float(object_base_z)
+            # 高度带通: 保留 base_z 在 [object_base_z ± height_band] 内的点
+            band_mask = (bz >= object_base_z - height_band) & (bz <= object_base_z + height_band)
+            bx = base_pts[0, band_mask]
+            by = base_pts[1, band_mask]
+            if len(bx) < min_points:
+                return None, None, None
+            # PCA on XY 分量 (2xN)
+            pts_xy = np.stack([bx, by], axis=0)  # 2xN
+            mean = pts_xy.mean(axis=1, keepdims=True)
+            centered = pts_xy - mean
+            cov = np.cov(centered)  # 2x2, rowvar=True
+            eigvals, eigvecs = np.linalg.eigh(cov)  # 升序: eigvals[0] <= eigvals[1]
+            lam_min = float(eigvals[0])
+            lam_max = float(eigvals[1])
+            elongation_ratio = lam_max / max(lam_min, 1e-9)
+            if elongation_ratio < elongation_threshold:
+                # 近圆形物体, 不重写朝向 (调用方用径向朝下)
+                return None, elongation_ratio, None
+            # 短轴 = 最小特征值对应的特征向量 (eigh 返回列向量, 升序)
+            short_axis_2d = eigvecs[:, 0]  # [vx, vy] in XY 平面
+            # 构造夹爪朝向 (base 系): Z=朝下, X=短轴, Y=Z×X
+            z_axis = np.array([0.0, 0.0, -1.0])
+            x_axis = np.array([short_axis_2d[0], short_axis_2d[1], 0.0])
+            x_norm = float(np.linalg.norm(x_axis))
+            if x_norm < 1e-6:
+                return None, elongation_ratio, None
+            x_axis = x_axis / x_norm
+            y_axis = np.cross(z_axis, x_axis)
+            y_norm = float(np.linalg.norm(y_axis))
+            if y_norm < 1e-6:
+                return None, elongation_ratio, None
+            y_axis = y_axis / y_norm
+            # 旋转矩阵 R = [X | Y | Z] (列向量)
+            R = np.column_stack([x_axis, y_axis, z_axis])
+            R4 = np.eye(4)
+            R4[:3, :3] = R
+            quat = tf_transformations.quaternion_from_matrix(R4)  # [x, y, z, w]
+            return [float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])], elongation_ratio, centroid_z
+        except Exception as e:
+            self.get_logger().warning(f"PCA 短轴对齐失败: {e}", throttle_duration_sec=5.0)
+            return None, None, None
+
     def detect_and_publish(self):
         """主检测函数"""
         if not self.rgb_ready or self.latest_rgb is None:
@@ -742,19 +939,10 @@ class ObjectDetector(Node):
             else:
                 boxes_sorted = []
 
-            # 选择与当前图像时间戳最接近的机械臂位姿 (循环外只算一次, 避免重复查询)
-            selected_robot_pose = self.robot_current_pose
+            # eye-to-hand: 无需选择机械臂位姿, 相机变换是常量
+            selected_robot_pose = None
             pose_time_diff = None
-            if self.latest_rgb_stamp is not None and len(boxes_sorted) > 0:
-                selected_robot_pose, pose_time_diff = self._get_best_robot_pose(self.latest_rgb_stamp)
-                if selected_robot_pose is not None and pose_time_diff is not None and pose_time_diff > self.robot_pose_sync_tolerance:
-                    self.get_logger().warning(
-                        f"图像与机械臂位姿时间差较大: {pose_time_diff:.3f}s, 结果可能抖动"
-                    )
-
-            original_robot_pose = self.robot_current_pose
-            self.robot_current_pose = selected_robot_pose
-            robot_position = self.get_robot_current_position()
+            robot_position = None  # eye-to-hand: 不跟踪机械臂位置
 
             # 不同物体用不同颜色框 (BGR), 循环使用
             box_colors = [
@@ -785,25 +973,38 @@ class ObjectDetector(Node):
                 real_width, real_height = self._get_class_dimensions(class_name)
                 volume = self.estimate_object_volume(real_width, real_height, shape="sphere")
 
-                # ========== 单目RGB估计: 用已知物体尺寸反推深度 (原始值) ==========
-                mono_depth = self.monocular_depth_from_bbox([x1, y1, x2, y2], class_name)
+                # ========== 深度估计: 优先 D455 深度相机, 失败时回退到单目 ==========
+                # 深度来源选择: 优先 D455, 失败时回退到单目
+                depth_source = "monocular"  # 默认单目 (D455失败或未启用时)
+                if self.use_depth_camera:
+                    self._depth_total_count += 1
+                    depth_m = self.depth_from_camera([x1, y1, x2, y2])
+                    if depth_m is None:
+                        # D455 深度无效 (反光/透明/超出范围), 自动回退到单目
+                        depth_m = self.monocular_depth_from_bbox([x1, y1, x2, y2], class_name)
+                        self._depth_fallback_count += 1
+                        depth_source = "monocular_fallback"  # D455失败→单目(用预设尺寸)
+                    else:
+                        depth_source = "d455_stereo"  # D455双目深度成功
+                else:
+                    depth_m = self.monocular_depth_from_bbox([x1, y1, x2, y2], class_name)
+                    depth_source = "monocular_only"  # 未启用深度相机
 
                 # 原始坐标变换 (深度成功时计算, 用于喂给滤波器)
+                # eye-to-hand: 直接相机→基座 (常量矩阵), 无需 ee_coords
                 camera_coords = None
                 ee_coords = None
                 base_coords = None
-                if mono_depth is not None:
-                    camera_coords = self.monocular_pixel_to_camera_coords(center_u, center_v, mono_depth)
-                    ee_coords = self.transform_camera_to_end_effector(camera_coords)
-                    if self.robot_current_pose is not None:
-                        base_coords, _ = self.transform_camera_to_base(camera_coords)
+                if depth_m is not None:
+                    camera_coords = self.monocular_pixel_to_camera_coords(center_u, center_v, depth_m)
+                    base_coords, _ = self.transform_camera_to_base(camera_coords)
 
                 # ========== 滤波: 匹配 track + EMA 更新 ==========
                 # 用原始观测更新 track, 再用滤波值替换发布值 (画框/坐标都用滤波后)
                 raw_obs = {
                     'x1': float(x1), 'y1': float(y1), 'x2': float(x2), 'y2': float(y2),
                     'center_u': center_u, 'center_v': center_v,
-                    'depth': mono_depth,
+                    'depth': depth_m,
                     'camera_coords': camera_coords,
                     'ee_coords': ee_coords,
                     'base_coords': base_coords,
@@ -824,7 +1025,7 @@ class ObjectDetector(Node):
                 x1, y1, x2, y2 = track.s_x1, track.s_y1, track.s_x2, track.s_y2
                 center_u = int((track.s_x1 + track.s_x2) / 2)
                 center_v = int((track.s_y1 + track.s_y2) / 2)
-                mono_depth = track.s_depth
+                depth_m = track.s_depth
                 camera_coords = track.s_cam
                 ee_coords = track.s_ee
                 base_coords = track.s_base
@@ -849,7 +1050,7 @@ class ObjectDetector(Node):
                     coord_label_x = int(x1) + 4
                     coord_label_y = int(y1) + 18
 
-                if mono_depth is None:
+                if depth_m is None:
                     # 深度估计失败 (像素尺寸异常或超出合理范围, 或 track 从未成功估计深度)
                     cv2.putText(display_img, "depth=N/A",
                                (coord_label_x, coord_label_y),
@@ -870,6 +1071,7 @@ class ObjectDetector(Node):
                         },
                         "volume_m3": round(volume, 6),
                         "depth_available": False,
+                        "depth_source": "none",  # D455+单目均失败
                         "filtered": True,
                         "track_id": track.track_id,
                     }
@@ -882,7 +1084,7 @@ class ObjectDetector(Node):
                 obj_x, obj_y, obj_z = camera_coords
 
                 # 框旁标注: 深度 + 基座坐标 (用滤波值)
-                cv2.putText(display_img, f"d={mono_depth:.2f}m",
+                cv2.putText(display_img, f"d={depth_m:.2f}m",
                            (coord_label_x, coord_label_y),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
                 if base_coords is not None:
@@ -891,6 +1093,9 @@ class ObjectDetector(Node):
                                (coord_label_x, coord_label_y + 16),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1)
 
+                # ── 估计直径 (bbox像素 + D455深度, 不依赖预设尺寸) ──
+                # diam = bbox平均像素尺寸 × 深度 / fx (针孔模型反投影)
+                _est_diam = ((float(x2 - x1) + float(y2 - y1)) / 2.0) * depth_m / self.fx
                 # ── 收集物体信息到 objects 列表 (用滤波值) ──
                 obj_info = {
                     "index": idx + 1,
@@ -906,12 +1111,10 @@ class ObjectDetector(Node):
                         "pixel_v": center_v,
                         "depth_m": round(obj_z, 4)
                     },
-                    "end_effector_position_m": {
-                        "x": round(ee_coords[0], 4),
-                        "y": round(ee_coords[1], 4),
-                        "z": round(ee_coords[2], 4)
-                    },
-                    "monocular_depth_m": round(mono_depth, 4),
+                    "end_effector_position_m": None,  # eye-to-hand: 不再计算 ee_coords
+                    "monocular_depth_m": round(depth_m, 4),
+                    "depth_source": depth_source,  # d455_stereo | monocular_fallback | monocular_only
+                    "estimated_diameter_m": round(_est_diam, 4),  # D455深度估计, 不依赖预设
                     "size_m": {
                         "width": round(real_width, 4),
                         "height": round(real_height, 4),
@@ -941,12 +1144,29 @@ class ObjectDetector(Node):
                 if primary_info is None:
                     primary_info = obj_info
                     self.publish_object_visualization(camera_coords, base_coords)
+                    # ── PCA 短轴对齐: 用当前帧深度图 + 滤波后 bbox 计算
+                    #    夹爪朝向 (顶视 + X 轴对齐物体短轴), 替代已移除的 GraspNet 6DoF ──
+                    if base_coords is not None and self.latest_depth is not None:
+                        grasp_ori, elong, centroid_z = self._compute_grasp_orientation(
+                            [x1, y1, x2, y2], self.latest_depth, float(base_coords[2]))
+                        if centroid_z is not None:
+                            _surf_z = float(base_coords[2])
+                            self.get_logger().info(
+                                f"📐 质心z={centroid_z:.4f} 表面z={_surf_z:.4f} "
+                                f"Δ={_surf_z-centroid_z:.4f} (若Δ=0.025已限幅; 若表面z偏低调大depth_offset_m)",
+                                throttle_duration_sec=2.0)
+                    else:
+                        grasp_ori, elong, centroid_z = None, None, None
+                    primary_info['grasp_orientation'] = grasp_ori
+                    primary_info['elongation_ratio'] = elong
+                    primary_info['centroid_base_z'] = centroid_z
 
                     coord_msg = Float64MultiArray()
+                    # eye-to-hand: ee_coords 不再计算, 用 0.0 占位 (向后兼容 Float64MultiArray 格式)
                     coord_data = [obj_x, obj_y, obj_z,
-                                 ee_coords[0], ee_coords[1], ee_coords[2],
+                                 0.0, 0.0, 0.0,  # ee_coords 占位 (eye-to-hand 不适用)
                                  real_width, real_height, volume,
-                                 conf, float(cls_id), mono_depth]
+                                 conf, float(cls_id), depth_m]
                     if distance_to_robot is not None:
                         coord_data.append(distance_to_robot)
                     coord_msg.data = coord_data
@@ -955,7 +1175,7 @@ class ObjectDetector(Node):
             # 循环结束: 清理过期 track + 未匹配 track miss_count++
             self._cleanup_stale_tracks(self.frame_count)
 
-            self.robot_current_pose = original_robot_pose
+            # eye-to-hand: 无需恢复 robot_current_pose (不再使用)
 
             # 画面左上角汇总: 检测到的物体数量 + 主物体坐标
             cv2.putText(display_img, f"Objects: {len(objects_list)}",
@@ -974,7 +1194,8 @@ class ObjectDetector(Node):
             # ── 发布 /detection_info (顶层=主物体字段 + objects 列表, 向后兼容) ──
             info_dict = {
                 "detected": primary_info is not None,
-                "method": "monocular_rgb",
+                "method": (primary_info.get("depth_source", "unknown") if primary_info is not None else "unknown"),
+                "header_stamp": self.latest_rgb_stamp,  # YOLO 检测时刻, 用于 grasp_pose_node 时间同步
                 "objects": objects_list,
                 "objects_count": len(objects_list),
             }
@@ -991,14 +1212,22 @@ class ObjectDetector(Node):
                     info_dict["base_position_m"] = primary_info["base_position_m"]
                 if "distance_to_robot_m" in primary_info:
                     info_dict["distance_to_robot_m"] = primary_info["distance_to_robot_m"]
+                # ── PCA 短轴对齐朝向 (替代 GraspNet) ──
+                if "grasp_orientation" in primary_info:
+                    info_dict["grasp_orientation"] = primary_info["grasp_orientation"]
+                    info_dict["elongation_ratio"] = primary_info.get("elongation_ratio")
+                # ── 质心 z (D455 深度点云估算, 不依赖预设尺寸, 供抓取高度补偿) ──
+                if "centroid_base_z" in primary_info and primary_info["centroid_base_z"] is not None:
+                    info_dict["centroid_base_z"] = primary_info["centroid_base_z"]
+                # ── 估计直径 (bbox+D455深度, 不依赖预设尺寸, 供夹爪闭合目标) ──
+                if "estimated_diameter_m" in primary_info:
+                    info_dict["estimated_diameter_m"] = primary_info["estimated_diameter_m"]
+                # ── 随动抓取接口占位 (中期实现: 光流/帧间位移估算物体速度) ──
+                info_dict["velocity_mps"] = None
 
-            if selected_robot_pose is not None:
-                info_dict["used_robot_pose"] = self.pose_stamped_to_dict(selected_robot_pose)
-                info_dict["tcp_pose_m"] = self.pose_stamped_to_dict(selected_robot_pose)
+            # eye-to-hand: 不再发布 used_robot_pose / tcp_pose_m (相机变换为常量)
             if self.latest_rgb_stamp is not None:
                 info_dict["rgb_stamp_s"] = round(self.latest_rgb_stamp, 6)
-            if pose_time_diff is not None:
-                info_dict["robot_pose_time_diff_s"] = round(pose_time_diff, 6)
 
             info_msg = String()
             info_msg.data = json.dumps(info_dict, ensure_ascii=False)
