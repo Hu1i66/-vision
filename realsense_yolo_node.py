@@ -150,7 +150,7 @@ class ObjectDetector(Node):
         self._cam_info_received = False
         
         # ================== 手眼标定数据（相机到机械臂基座, 眼在手外）==================
-        # 来源: /home/lxf/handeye/result/2026-07-25_03-57-46_calibration.json
+        # 来源: /home/lxf/handeye/result/2026-07-26_16-17-46_calibration.json
         # eye-to-hand: 相机固定在传送带上方, T_cam_to_base 是常量 (不依赖 TCP 位姿)
         # 平移向量 (单位: 米)
         self.camera_to_base_translation = np.array([
@@ -248,8 +248,8 @@ class ObjectDetector(Node):
         # 补偿: 加到 base 坐标 (负值=减去=修正偏大, 默认 -0.025 = 减 2.5cm)
         # 调参: ros2 param set /object_detector x_offset_m -0.020
         #       ros2 param set /object_detector y_offset_m -0.020
-        self.x_offset_m = float(self.declare_parameter('x_offset_m', -0.025).value)
-        self.y_offset_m = float(self.declare_parameter('y_offset_m', 0.005).value)
+        self.x_offset_m = float(self.declare_parameter('x_offset_m', -0.045).value)
+        self.y_offset_m = float(self.declare_parameter('y_offset_m', -0.010).value)
         # Z 补偿: 正值=抬高 (防下探过多撞台面), 默认 +0.030 = 加 3cm
         # 调参: ros2 param set /object_detector z_offset_m 0.025
         self.z_offset_m = float(self.declare_parameter('z_offset_m', 0.030).value)

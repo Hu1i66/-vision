@@ -85,9 +85,9 @@ from data_utils import CameraInfo as GraspNetCameraInfo, create_point_cloud_from
 
 
 # ==================== 手眼标定数据 (eye-to-hand 常量变换) ====================
-# 来源: /home/lxf/handeye/result/2026-07-25_03-57-46_calibration.json
+# 来源: /home/lxf/handeye/result/2026-07-26_16-17-46_calibration.json
 # 与 realsense_yolo_node.py 中完全一致
-_HANDEYE_JSON_PATH = "/home/lxf/handeye/result/2026-07-25_03-57-46_calibration.json"
+_HANDEYE_JSON_PATH = "/home/lxf/handeye/result/2026-07-26_16-17-46_calibration.json"
 
 
 def _quat_to_rotmat(qx, qy, qz, qw):
